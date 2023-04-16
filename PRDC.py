@@ -1,31 +1,12 @@
 import numpy as np
 import QuantLib as ql
 
-def data_factory():
-    valuation_date = ql.Date(11, 4, 2023)
-    ql.Settings.instance().evaluationDate = valuation_date
-    domestic_curve = ql.FlatForward(valuation_date, ql.QuoteHandle(ql.SimpleQuote(0.01)), ql.Actual360())
-    domestic_process = ql.HullWhiteProcess(ql.YieldTermStructureHandle(domestic_curve), 0.02, 0.26)
-    foreign_curve = ql.FlatForward(valuation_date, ql.QuoteHandle(ql.SimpleQuote(0.035)), ql.Actual360())
-    foreign_process = ql.HullWhiteProcess(ql.YieldTermStructureHandle(foreign_curve), 0.02, 0.22)
-    discount_curve = ql.FlatForward(valuation_date, ql.QuoteHandle(ql.SimpleQuote(0.005)), ql.Actual360())
-    discount_curve_handle = ql.YieldTermStructureHandle(discount_curve)
-    correlation_matrix = np.array([[1.0,-0.06,-0.03],[-0.06,1.0,0.02],[-0.03,0.02,1.0]])
-    return domestic_process, foreign_process, correlation_matrix, discount_curve_handle
-
-class FxPathGenerator:
-    def __init__(self, valuation_date, coupon_schedule, day_counter, fx_spot, fx_sigma, 
-        domestic_process, foreign_process, correlation_matrix):
-        
+class PathGenerator:
+    def __init__(self, valuation_date, coupon_schedule, day_counter, process):        
         self.valuation_date = valuation_date
         self.coupon_schedule = coupon_schedule
         self.day_counter = day_counter
-        self.fx_spot = fx_spot
-        self.fx_sigma = fx_sigma
-        self.domestic_process = domestic_process
-        self.foreign_process = foreign_process        
-        self.correlation_matrix = correlation_matrix
-        self.n_processes = 3
+        self.process = process
         #
         self.create_time_grids()
         
@@ -34,34 +15,23 @@ class FxPathGenerator:
         remaining_coupon_dates = all_coupon_dates[all_coupon_dates > self.valuation_date]
         self.time_grid = np.array([self.day_counter.yearFraction(self.valuation_date, date) 
             for date in remaining_coupon_dates])
-        self.grid_steps = np.concatenate((np.array([self.time_grid[0]]), np.diff(self.time_grid)))
+        self.time_grid = np.concatenate((np.array([0.0]), self.time_grid))
+        self.grid_steps = np.diff(self.time_grid)
         self.n_steps = self.grid_steps.shape[0]
         
-    def create_correlated_normal_variates(self):
-        cholesky_matrix = np.linalg.cholesky(self.correlation_matrix)
-        correlated_normal_variates = cholesky_matrix.dot(np.random.normal(0.0, 1.0, (self.n_processes, self.n_steps)))
-        return correlated_normal_variates
-        
     def next_path(self):
-        e = self.create_correlated_normal_variates()
-        spot_domestic = self.domestic_process.x0()
-        spot_foreign = self.foreign_process.x0()
-        spot_fx = self.fx_spot
-        
-        dw_domestic = e[0,:] * self.grid_steps
-        dw_foreign = e[1,:] * self.grid_steps
-        dw_fx = e[2,:] * self.grid_steps
-        fx_path = np.empty(self.n_steps, dtype=float)
+        e = np.random.normal(0.0, 1.0, self.n_steps)
+        spot = self.process.x0()
+        dw = e * self.grid_steps
+        path = np.zeros(self.n_steps, dtype=float)
         
         for i in range(self.n_steps):
             dt = self.grid_steps[i]
             t = self.time_grid[i]
-            spot_domestic = domestic_process.evolve(t, spot_domestic, dt, dw_domestic[i])
-            spot_foreign = foreign_process.evolve(t, spot_foreign, dt, dw_foreign[i])
-            spot_fx = spot_fx + ((spot_domestic - spot_foreign) * spot_fx * dt) + (self.fx_sigma * spot_fx * dw_fx[i])
-            fx_path[i] = spot_fx
+            spot = self.process.evolve(t, spot, dt, dw[i])
+            path[i] = spot
 
-        return fx_path
+        return path
 
 class MonteCarloPricerPRDC:
     def __init__(self, valuation_date, coupon_schedule, day_counter, notional, discount_curve_handle, 
@@ -144,10 +114,31 @@ class MonteCarloPricerPRDC:
         pv[-1] += self.redemption_leg_npv
         
         self.cash_flow_table = np.array([date, amount, pv])
-        return self.coupon_leg_npv + self.redemption_leg_npv    
+        return self.coupon_leg_npv + self.redemption_leg_npv
+    
+def process_factory():
+    today = ql.Settings.instance().evaluationDate
+    
+    domestic_curve = ql.FlatForward(today, ql.QuoteHandle(ql.SimpleQuote(0.01)), ql.Actual360())
+    domestic_curve = ql.YieldTermStructureHandle(domestic_curve)
+    foreign_curve = ql.FlatForward(today, ql.QuoteHandle(ql.SimpleQuote(0.03)), ql.Actual360())
+    foreign_curve = ql.YieldTermStructureHandle(foreign_curve)
+    
+    fx_vol = ql.QuoteHandle(ql.SimpleQuote(0.1))
+    fx_vol_curve = ql.BlackVolTermStructureHandle(ql.BlackConstantVol(today, ql.NullCalendar(), fx_vol, ql.Actual360()))    
+    fx_spot = ql.QuoteHandle(ql.SimpleQuote(133.2681))
+    
+    return ql.GarmanKohlagenProcess(fx_spot, foreign_curve, domestic_curve, fx_vol_curve)
 
-# create processes for FX path generator, correlation and discount curve for JPY
-domestic_process, foreign_process, correlation_matrix, discount_curve_handle = data_factory()
+today = ql.Date(11, 4, 2023)
+ql.Settings.instance().evaluationDate = today
+
+# create discount curve
+discount_curve = ql.FlatForward(today, ql.QuoteHandle(ql.SimpleQuote(0.005)), ql.Actual360())
+discount_curve_handle = ql.YieldTermStructureHandle(discount_curve)
+
+# create FX process
+process = process_factory()
 
 # create schedules for coupon- and intro coupon payments
 effectiveDate = ql.Date(3, ql.September, 2015)
@@ -160,10 +151,7 @@ intro_coupon_schedule = ql.MakeSchedule(effectiveDate, intro_coupon_termination_
     backwards=True, calendar=ql.TARGET(), convention=ql.ModifiedFollowing)
 
 # create FX path generator
-usd_jpy_spot = 133.2681
-usd_jpy_vol = 0.1
-fx_path_generator = FxPathGenerator(ql.Settings.instance().evaluationDate, coupon_schedule, ql.Actual360(), 
-    usd_jpy_spot, usd_jpy_vol, domestic_process, foreign_process, correlation_matrix)
+fx_path_generator = PathGenerator(today, coupon_schedule, ql.Actual360(), process)
 
 # create PRDC pricer
 notional = 300000000.0
@@ -184,10 +172,4 @@ print('Cash flow dates: {}'.format(prdc_pricer.cash_flow_table[0]))
 print()
 print('Cash flows: {}'.format(prdc_pricer.cash_flow_table[1]))
 print()
-print('Present values of cash flows: {}'.format(prdc_pricer.cash_flow_table[2]))
-
-
-
-
-
-
+print('Present values of cash flows: {}'.format(prdc_pricer.cash_flow_table[2]))    
